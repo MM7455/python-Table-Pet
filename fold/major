@@ -1,0 +1,262 @@
+import sys
+import os
+import re
+import requests
+import random
+from PyQt6.QtWidgets import QApplication, QWidget, QLabel, QMenu, QPushButton,QVBoxLayout,QLineEdit,QInputDialog, QMessageBox, QTextEdit
+from PyQt6.QtGui import QPixmap, QPainter, QGuiApplication, QCursor
+from PyQt6.QtCore import Qt, QPoint, QTimer, QThread, pyqtSignal
+
+script_dir = os.path.dirname(os.path.abspath(__file__))
+os.chdir(script_dir)
+
+QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
+    Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+)
+
+os.environ["DEEPSEEK_API_KEY"] = "sk-e48fad29d2f14ef7bda3302d718c11b6"
+api_key = os.getenv("DEEPSEEK_API_KEY")
+
+def load_images(folder):
+    """ 从文件夹读取所有 PNG 图片，按文件名中的数字顺序排序 """
+    files = sorted(
+        [f for f in os.listdir(folder) if f.endswith(".png")], 
+        key=lambda x: int(re.search(r'\d+', x).group())  # 提取文件名中的数字部分排序
+    )
+    return [QPixmap(os.path.join(folder, f)) for f in files]
+
+from requests.exceptions import RequestException, HTTPError  # 新增这行
+class DeepSeekAI:
+    BASE_URL = "https://api.deepseek.com/v1" #存储API基础地址
+    
+    @staticmethod #验证环境变量是否设置
+    def validate_key():
+        if "DEEPSEEK_API_KEY" not in os.environ:
+            raise RuntimeError("未检测到DEEPSEEK_API_KEY环境变量")
+
+class AIWorker(QThread): #发送API请求
+    """ 后台AI处理线程 """
+    response_received = pyqtSignal(str)
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, prompt):
+        super().__init__()
+        self.prompt = prompt
+        self.api_key = os.getenv("DEEPSEEK_API_KEY")
+
+    def run(self):
+        try:
+            response = requests.post( #向 DeepSeek AI 发送 HTTP POST 请求，并把用户输入 (self.prompt) 发送给 AI。
+                f"{DeepSeekAI.BASE_URL}/chat/completions", 
+                headers={
+                    "Authorization": f"Bearer {self.api_key}", #"Authorization": f"Bearer {self.api_key}" → 用 API Key 进行身份验证。
+                    "Content-Type": "application/json" #"Content-Type": "application/json" → 告诉服务器数据是 JSON 格式。
+                },
+                json={ #（请求数据）
+                    "model": "deepseek-chat",
+                    "messages": [
+                        {"role": "system", "content": "回答不需要解释，直接用简洁的短语骂用户"},
+                        {"role": "user", "content": self.prompt} #传入用户输入的问题，AI 会基于这个内容生成回复。
+                    ],
+                    "temperature": 0.7, #控制 AI 回答的随机性（0 是最确定，1 是最随机）
+                },
+                timeout=15
+            )
+            
+            response.raise_for_status() #检查请求是否成功
+            data = response.json() #把服务器返回的 JSON 数据转换成 Python 字典。
+            
+            if "choices" not in data:
+                raise ValueError("无效API响应结构")
+                
+            reply = data["choices"][0]["message"]["content"]
+            self.response_received.emit(reply.strip()) #把 AI 回复发送回主线程
+            
+        except RequestException as e:
+            error_msg = f"网络错误: {e.response.text if e.response else str(e)}"
+            self.error_occurred.emit(error_msg)
+        except ValueError as e:
+            self.error_occurred.emit(f"API错误: {str(e)}")
+        except Exception as e:
+            self.error_occurred.emit(f"系统错误: {str(e)}")
+class ChatWindow(QWidget):
+    """ 聊天窗口，显示 AI 回复并输入消息 """
+    def __init__(self, pet):
+        super().__init__()
+        self.pet = pet  # 绑定桌宠
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+        self.setFixedSize(250, 100)  # 固定窗口大小
+        self.move(self.pet.x() + 100, self.pet.y() - 50)  # 默认在桌宠右上角
+
+        self.chat_label = QLabel("", self)
+        self.chat_label.setStyleSheet("background-color: white; border-radius: 5px; padding: 5px;")
+        self.chat_label.setWordWrap(True)
+        self.chat_label.setGeometry(10, 10, 230, 40)  # 聊天气泡区域
+
+        self.input_box = QLineEdit(self)
+        self.input_box.setPlaceholderText("和我聊天吧！")
+        self.input_box.setGeometry(10, 60, 230, 30)
+        self.input_box.returnPressed.connect(self.process_input)
+
+        self.worker = None
+        self.hide()  # 初始隐藏
+
+    def process_input(self):
+        """ 处理用户输入并获取 AI 回复 """
+        text = self.input_box.text().strip()
+        if not text:  # 如果用户输入为空
+           self.chat_label.setText("你说什么~")  # 给个提示
+           return
+        self.input_box.hide()  # 隐藏输入框
+        self.chat_label.show()
+        self.get_ai_response(text)
+
+    def get_ai_response(self, text):
+        """ 使用 AIWorker 线程处理 AI 回复 """
+        self.chat_label.setText("思考中...")
+        self.worker = AIWorker(text)
+        self.worker.response_received.connect(self.display_ai_response)
+        self.worker.error_occurred.connect(self.display_error) #两种信号
+        self.worker.finished.connect(self.reset_worker)  # 线程结束后清理
+        self.worker.start()
+
+    def display_ai_response(self, reply):
+        """ 显示 AI 回复 """
+        self.chat_label.setText(reply)
+        self.chat_label.adjustSize()
+        self.adjustPosition()
+        QTimer.singleShot(10000, self.hide)
+
+    def display_error(self, error_msg):
+        """ 发生错误时显示 """
+        self.chat_label.setText(error_msg)
+        self.chat_label.adjustSize()
+        self.adjustPosition()
+        QTimer.singleShot(10000, self.hide)
+
+    def adjustPosition(self):
+        """ 确保聊天框在桌宠旁边 """
+        self.move(self.pet.x() + 100, self.pet.y())
+
+    def reset_worker(self):
+        self.worker = None
+
+    def prepare_new_chat(self): 
+        self.chat_label.hide()
+        self.chat_label.setText("")
+        self.input_box.clear()       # 清空输入框
+        self.input_box.show()        # 确保输入框可见
+        self.input_box.setFocus()
+    
+class DesktopPet(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        
+        # 加载 PNG 图片
+        self.idle_frames = load_images("animations/idle")
+        self.dance_frames = load_images("animations/dance")
+        self.drag_frames = load_images("animations/drag")
+        self.frames = self.idle_frames
+        self.frame_idx = 0
+        self.is_dragging = False
+
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_animation)
+        self.timer.start(32)
+
+        self.chat_window = ChatWindow(self)
+
+        # **右键菜单**
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self.on_context_menu_request)
+
+    def update_animation(self):
+        self.frame_idx = (self.frame_idx + 1) % len(self.frames)
+        self.resize(self.frames[self.frame_idx].size())
+        self.repaint()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.drawPixmap(0, 0, self.frames[self.frame_idx])
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.drag_position = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            self.is_dragging = True
+            self.switch_to_drag()
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() & Qt.MouseButton.LeftButton:
+            self.move(event.globalPosition().toPoint() - self.drag_position)
+            self.chat_window.adjustPosition()
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if self.is_dragging:
+            self.is_dragging = False
+            self.restore_animation()
+            event.accept()
+
+    def switch_to_drag(self):
+        if self.frames != self.drag_frames:
+            self.frames = self.drag_frames
+            self.frame_idx = 0
+            self.timer.setInterval(32)
+
+    def restore_animation(self):
+        if self.frames == self.drag_frames:
+            self.frames = self.idle_frames
+            self.frame_idx = 0
+
+
+    def on_context_menu_request(self, pos):
+        """ 上下文菜单请求的正式处理 """
+        menu = QMenu(self)
+        chat_action = menu.addAction("聊天")
+        dance_action = menu.addAction("跳舞")
+        idle_action = menu.addAction("待机")
+        quit_action = menu.addAction("退出")
+
+        dance_action.triggered.connect(self.start_dance)
+        chat_action.triggered.connect(self.toggle_chat)
+        idle_action.triggered.connect(self.start_idle)
+        quit_action.triggered.connect(self.safe_close)  # 修改关闭方式
+
+        # 使用绝对坐标显示菜单
+        menu.exec(self.mapToGlobal(pos))
+
+    def toggle_chat(self):
+        """ 切换聊天框显示/隐藏 """
+        if self.chat_window.isVisible():
+            self.chat_window.hide()
+        else:
+            self.chat_window.show()
+            self.chat_window.adjustPosition()
+            self.chat_window.prepare_new_chat()
+
+    def start_dance(self):
+        self.frames = self.dance_frames
+        self.frame_idx = 0
+        self.timer.setInterval(16)
+
+    def start_idle(self):
+        self.frames = self.idle_frames
+        self.frame_idx = 0
+        self.timer.setInterval(32)
+
+    def safe_close(self):
+        if self.timer.isActive():
+            self.timer.stop()
+        self.chat_window.close()
+        self.close()
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    pet = DesktopPet()
+    pet.show()
+    sys.exit(app.exec())
