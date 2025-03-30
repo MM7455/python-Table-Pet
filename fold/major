@@ -14,7 +14,7 @@ QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
     Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
 )
 
-os.environ["DEEPSEEK_API_KEY"] = "sk-e48fad29d2f14ef7bda3302d718c11b6"
+os.environ["DEEPSEEK_API_KEY"] = "DEEPSEEK_API_KEY"
 api_key = os.getenv("DEEPSEEK_API_KEY")
 
 def load_images(folder):
